@@ -1,0 +1,18 @@
+version: "3.9"
+
+services:
+  anp-cng-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: anp-cng-api
+    ports:
+      - "8080:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:8080
+    volumes:
+      - .:/app
+      - /app/bin
+      - /app/obj
+    command: ["dotnet", "watch", "run", "--urls", "http://0.0.0.0:8080"]

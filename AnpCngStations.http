@@ -1,0 +1,6 @@
+@AnpCngStations_HostAddress = http://localhost:5114
+
+GET {{AnpCngStations_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###
