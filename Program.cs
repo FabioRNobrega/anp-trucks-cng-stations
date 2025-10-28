@@ -1,6 +1,8 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using CsvHelper;
+using CsvHelper.Configuration;
 
 
 var builder = WebApplication.CreateBuilder(args);
@@ -42,7 +44,7 @@ app.MapGet("/health", () =>
 
 
 
-app.MapGet("/truck-cgn-stations", async () =>
+app.MapGet("/truck-cgn-stations", async (HttpContext context) =>
 {
     const string url = "https://revendedoresapi.anp.gov.br/v1/combustivel?numeropagina=1";
 
@@ -66,7 +68,15 @@ app.MapGet("/truck-cgn-stations", async () =>
     var filtered = FilterStations(anpResponse.Data).ToList();
     var enriched = EnrichStations(filtered, AddNaturgyFlag, AddAccuracyScore).ToList();
 
-    return Results.Ok(new { total = enriched.Count, stations = enriched });
+    var csvBytes = CsvExporter.ExportStationsToScv(enriched);
+
+    context.Response.Headers.Append(
+        "Content-Disposition",
+        "attachment; filename=truck_cng_stations_by_anp.csv"
+    );
+
+    return Results.File(csvBytes, "text/csv");
+
 })
 .WithName("GetTruckCngStations")
 .WithDescription("Returns all ANP stations from page 1 that provide GNV");
@@ -203,12 +213,12 @@ public class Station
     public string? Complemento { get; set; }
     public string? Municipio { get; set; }
     public string? Uf { get; set; }
+    public string? Cep { get; set; }
     public string? SituacaoConstatada { get; set; }
+    public string? Distribuidora { get; set; } 
     public List<Product>? Produtos { get; set; }
     public string? Latitude { get; set; }
     public string? Longitude { get; set; }
-    public string? Latitude_ANP4C { get; set; }
-    public string? Longitude_ANP4C { get; set; }
     public string? EstimativaAcuracia { get; set; }
     public bool NaturgyVerified { get; set; }
     public double AccuracyScore { get; set; }
@@ -235,4 +245,102 @@ public static class Naturgy
         "08064380000130",
         "06012414000117"
     };
+}
+
+public static class CsvSchema
+{
+    public static readonly string[] Headers =
+    {
+        "status",
+        "site_name",
+        "street",
+        "zip_code",
+        "city",
+        "country",
+        "country_code",
+        "latitude",
+        "longitude",
+        "operator",
+        "verified_for_trucks",
+        "green_certified",
+        "lots_partner",
+        "restrooms",
+        "food",
+        "wifi",
+        "card_terminal",
+        "truck_parking",
+        "showers",
+        "truck_wash",
+        "google_maps_url",
+        "date_when_added_to_list",
+        "source",
+        "comments",
+        "accuracy_score"
+    };
+}
+
+
+public static class CsvExporter
+{
+    public static byte[] ExportStationsToScv(IEnumerable<Station> stations)
+    {
+        using var memory = new MemoryStream();
+        using var writer = new StreamWriter(memory, Encoding.UTF8);
+        using var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture)
+        {
+            Delimiter = ",",
+            Quote = '"',
+            ShouldQuote = args => true,
+        });
+
+        foreach (var header in CsvSchema.Headers)
+            csv.WriteField(header);
+        csv.NextRecord();
+
+        // Write station rows
+        foreach (var s in stations)
+        {
+            csv.WriteField(s.SituacaoConstatada);
+            csv.WriteField(s.RazaoSocial);
+            csv.WriteField(s.Endereco);
+            csv.WriteField(s.Cep);
+            csv.WriteField(s.Municipio);
+            csv.WriteField("Brazil");
+            csv.WriteField("BR");
+            csv.WriteField("");
+            csv.WriteField("");
+            csv.WriteField(s.Distribuidora);
+            csv.WriteField(s.NaturgyVerified ? "true" : "false"); // verified_for_trucks
+            csv.WriteField(""); // green_certified
+            csv.WriteField("false"); // lots_partner
+            csv.WriteField(""); // restrooms
+            csv.WriteField(""); // food
+            csv.WriteField(""); // wifi
+            csv.WriteField(""); // card_terminal
+            csv.WriteField(""); // truck_parking
+            csv.WriteField(""); // showers
+            csv.WriteField(""); // truck_wash
+            csv.WriteField(GetGoogleMapsUrl(s));
+            csv.WriteField(DateTime.UtcNow.ToString("yyyy-MM-dd")); // date_when_added_to_list
+            csv.WriteField("ANP API v1");
+            csv.WriteField(""); // comments
+            csv.WriteField(s.AccuracyScore.ToString("0.0", CultureInfo.InvariantCulture));
+            csv.NextRecord();
+        }
+
+        writer.Flush();
+        return memory.ToArray();
+
+    }
+    
+    private static string GetGoogleMapsUrl(Station s)
+    {
+        if (string.IsNullOrWhiteSpace(s.RazaoSocial) &&
+        string.IsNullOrWhiteSpace(s.Endereco) &&
+        string.IsNullOrWhiteSpace(s.Municipio))
+            return "";
+
+        var query = Uri.EscapeDataString($"{s.RazaoSocial} {s.Endereco} {s.Municipio} {s.Uf}");
+        return $"https://www.google.com/maps?q={query}";
+    }
 }
