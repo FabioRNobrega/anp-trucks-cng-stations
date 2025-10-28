@@ -90,11 +90,11 @@ flowchart LR
 
 Stations are included only if:
 
-1. `"GÁS NATURAL VEICULAR"` appears in the fuel products list
-2. Address or complement contains `"RODOVIA"`, `"DUTRA"`, `"KM"`  
-3. `situacaoConstatada == 200` (active station)  
-4. Total tank capacity ≥ 30 m³ 
-5. Has beside gás station also Diesel type S10 or S500
+1. `situacaoConstatada == 200` (active station)  
+2. `"GÁS NATURAL VEICULAR"` appears in the fuel products list
+3. Address or complement contains `"RODOVIA"`, `"DUTRA"`, `"KM"`  
+4. Has beside gás station also Diesel type S10 or S500
+5. Total tank capacity ≥ 30 m³ 
 6. The station belongs to the **Naturgy** CNPJ list  
 
 Each validation increases an internal **accuracy score**: 

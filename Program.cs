@@ -74,11 +74,20 @@ app.MapGet("/truck-cgn-stations", async () =>
 
 static IEnumerable<Station> FilterStations(IEnumerable<Station> data)
 {
-    return data.Where(HasCng)
-        .Where(HasRoadHints);
+    return data.Where(IsActive)
+        .Where(HasCng)
+        .Where(HasRoadHints)
+        .Where(HasDieselWithCapacity);
 }
 
-static bool HasCng(Station s) => s.Produtos?.Any(p => string.Equals(p.Produto, "GÁS NATURAL VEICULAR", StringComparison.OrdinalIgnoreCase)) == true;
+static bool HasCng(Station s)
+{
+    if (s.Produtos == null) return false;
+    return s.Produtos.Any(p =>
+        string.Equals(p.Produto, "GÁS NATURAL VEICULAR", StringComparison.OrdinalIgnoreCase)
+        && (p.QtdeBicos ?? 0) > 0
+    );
+}  
 
 static bool HasRoadHints(Station s)
 {
@@ -101,6 +110,28 @@ static string Normalize(string? value)
     }
 
     return sb.ToString().Normalize(NormalizationForm.FormC).ToUpperInvariant();
+}
+
+static bool HasDieselWithCapacity(Station s)
+{
+    if (s.Produtos == null) return false;
+
+    var dieselTanks = s.Produtos
+         .Where(p => !string.IsNullOrWhiteSpace(p.Produto) &&
+         (p.Produto.Contains("S10", StringComparison.OrdinalIgnoreCase) || p.Produto.Contains("S500", StringComparison.OrdinalIgnoreCase)))
+         .Select(p => p.Tancagem ?? 0)
+         .ToList();
+
+    if (dieselTanks.Count == 0) return false;
+
+    var totalDieselCapacity = dieselTanks.Sum();
+
+    return totalDieselCapacity >= 30;
+}
+
+static bool IsActive(Station s)
+{
+    return string.Equals(s.SituacaoConstatada, "200", StringComparison.OrdinalIgnoreCase);
 }
 
 app.Run();
@@ -128,6 +159,9 @@ public class Station
     public List<Product>? Produtos { get; set; }
     public string? Latitude { get; set; }
     public string? Longitude { get; set; }
+    public string? Latitude_ANP4C { get; set; }
+    public string? Longitude_ANP4C { get; set; }
+    public string? EstimativaAcuracia { get; set; }
 }
 
 public class Product
