@@ -1,5 +1,6 @@
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 
 
 var builder = WebApplication.CreateBuilder(args);
@@ -41,7 +42,7 @@ app.MapGet("/health", () =>
 
 
 
-app.MapGet("/truck-cg-stations", async () =>
+app.MapGet("/truck-cgn-stations", async () =>
 {
     const string url = "https://revendedoresapi.anp.gov.br/v1/combustivel?numeropagina=1";
 
@@ -53,7 +54,6 @@ app.MapGet("/truck-cg-stations", async () =>
     };
 
     var json = await response.Content.ReadAsStringAsync();
-
     var options = new JsonSerializerOptions
     {
         PropertyNameCaseInsensitive = true,
@@ -63,17 +63,47 @@ app.MapGet("/truck-cg-stations", async () =>
     var anpResponse = JsonSerializer.Deserialize<AnpResponse>(json, options);
     if (anpResponse?.Data == null) return Results.Problem("No data returned from ANP API.");
 
-    var filtered = anpResponse.Data
-                        .Where(s => s.Produtos?.Any(p => p.Produto == "GÁS NATURAL VEICULAR") == true)
-                        .ToList();
+    var filtered = FilterStations(anpResponse.Data).ToList();
 
     return Results.Ok(new { total = filtered.Count, stations = filtered });
 })
 .WithName("GetTruckCngStations")
 .WithDescription("Returns all ANP stations from page 1 that provide GNV");
 
-app.Run();
+// Helpers
 
+static IEnumerable<Station> FilterStations(IEnumerable<Station> data)
+{
+    return data.Where(HasCng)
+        .Where(HasRoadHints);
+}
+
+static bool HasCng(Station s) => s.Produtos?.Any(p => string.Equals(p.Produto, "GÁS NATURAL VEICULAR", StringComparison.OrdinalIgnoreCase)) == true;
+
+static bool HasRoadHints(Station s)
+{
+    var haystack = Normalize($"{s.Endereco} {s.Complemento}");
+    string[] needles = { "RODOVIA", "DUTRA", "KM" };
+
+    return needles.Any(n => haystack.Contains(n, StringComparison.Ordinal));
+}
+
+static string Normalize(string? value)
+{
+    if (string.IsNullOrWhiteSpace(value)) return string.Empty;
+
+    var formD = value.Normalize(NormalizationForm.FormD);
+    var sb = new StringBuilder(capacity: formD.Length);
+    foreach (var ch in formD)
+    {
+        var uc = CharUnicodeInfo.GetUnicodeCategory(ch);
+        if (uc != UnicodeCategory.NonSpacingMark) sb.Append(ch);
+    }
+
+    return sb.ToString().Normalize(NormalizationForm.FormC).ToUpperInvariant();
+}
+
+app.Run();
 
 // Models
 
