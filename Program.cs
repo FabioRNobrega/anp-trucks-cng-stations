@@ -64,15 +64,14 @@ app.MapGet("/truck-cgn-stations", async () =>
     if (anpResponse?.Data == null) return Results.Problem("No data returned from ANP API.");
 
     var filtered = FilterStations(anpResponse.Data).ToList();
-    var enriched = EnrichStations(filtered, AddNaturgyFlag).ToList();
+    var enriched = EnrichStations(filtered, AddNaturgyFlag, AddAccuracyScore).ToList();
 
     return Results.Ok(new { total = enriched.Count, stations = enriched });
 })
 .WithName("GetTruckCngStations")
 .WithDescription("Returns all ANP stations from page 1 that provide GNV");
 
-// Helpers
-
+// Filters
 static IEnumerable<Station> FilterStations(IEnumerable<Station> data)
 {
     return data.Where(IsActive)
@@ -135,6 +134,7 @@ static bool IsActive(Station s)
     return string.Equals(s.SituacaoConstatada, "200", StringComparison.OrdinalIgnoreCase);
 }
 
+// Data Additions
 static IEnumerable<Station> EnrichStations(IEnumerable<Station> stations, params StationEnricher[] enrichers)
 {
     foreach (var station in stations)
@@ -147,10 +147,35 @@ static IEnumerable<Station> EnrichStations(IEnumerable<Station> stations, params
     }
 }
 
-
 static Station AddNaturgyFlag(Station s)
 {
     s.NaturgyVerified = s.Cnpj != null && Naturgy.Cnpjs.Contains(s.Cnpj);
+    return s;
+}
+
+static Station AddAccuracyScore(Station s)
+{
+    double score = 0;
+
+    if (HasCng(s)) score += 20;
+    if (HasDieselWithCapacity(s)) score += 20;
+    if (HasRoadHints(s)) score += 20;
+    if (IsActive(s)) score += 20;
+
+    // estimativaAcuracia fro GPS: lower = better
+    if (double.TryParse(s.EstimativaAcuracia, out double est))
+    {
+        double positionScore = 10 - Math.Min(est, 10);
+        if (positionScore > 0) score += positionScore;
+    }
+
+    if (s.NaturgyVerified)
+    {
+        s.AccuracyScore = 100;
+        return s;
+    } 
+
+    s.AccuracyScore = Math.Min(score, 100);
     return s;
 }
 
@@ -159,7 +184,6 @@ static Station AddNaturgyFlag(Station s)
 app.Run();
 
 // Models
-
 delegate Station StationEnricher(Station s);
 
 public class AnpResponse
@@ -187,6 +211,7 @@ public class Station
     public string? Longitude_ANP4C { get; set; }
     public string? EstimativaAcuracia { get; set; }
     public bool NaturgyVerified { get; set; }
+    public double AccuracyScore { get; set; }
 }
 
 public class Product
