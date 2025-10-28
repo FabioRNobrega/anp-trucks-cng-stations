@@ -64,8 +64,9 @@ app.MapGet("/truck-cgn-stations", async () =>
     if (anpResponse?.Data == null) return Results.Problem("No data returned from ANP API.");
 
     var filtered = FilterStations(anpResponse.Data).ToList();
+    var enriched = EnrichStations(filtered, AddNaturgyFlag).ToList();
 
-    return Results.Ok(new { total = filtered.Count, stations = filtered });
+    return Results.Ok(new { total = enriched.Count, stations = enriched });
 })
 .WithName("GetTruckCngStations")
 .WithDescription("Returns all ANP stations from page 1 that provide GNV");
@@ -134,9 +135,32 @@ static bool IsActive(Station s)
     return string.Equals(s.SituacaoConstatada, "200", StringComparison.OrdinalIgnoreCase);
 }
 
+static IEnumerable<Station> EnrichStations(IEnumerable<Station> stations, params StationEnricher[] enrichers)
+{
+    foreach (var station in stations)
+    {
+        var enriched = station;
+        foreach (var enricher in enrichers)
+            enriched = enricher(enriched);
+
+        yield return enriched;
+    }
+}
+
+
+static Station AddNaturgyFlag(Station s)
+{
+    s.NaturgyVerified = s.Cnpj != null && Naturgy.Cnpjs.Contains(s.Cnpj);
+    return s;
+}
+
+
+
 app.Run();
 
 // Models
+
+delegate Station StationEnricher(Station s);
 
 public class AnpResponse
 {
@@ -162,6 +186,7 @@ public class Station
     public string? Latitude_ANP4C { get; set; }
     public string? Longitude_ANP4C { get; set; }
     public string? EstimativaAcuracia { get; set; }
+    public bool NaturgyVerified { get; set; }
 }
 
 public class Product
@@ -170,4 +195,19 @@ public class Product
     public double? Tancagem { get; set; }
     public string? UnidMedidaTancagem { get; set; }
     public int? QtdeBicos { get; set; }
+}
+
+public static class Naturgy
+{
+    public static readonly HashSet<string> Cnpjs = new()
+    {
+        "01797812000172",
+        "30243299000176",
+        "29178001000102",
+        "00624710000192",
+        "07187563000180",
+        "31465255000153",
+        "08064380000130",
+        "06012414000117"
+    };
 }
