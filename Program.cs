@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using CsvHelper;
@@ -6,6 +7,13 @@ using CsvHelper.Configuration;
 
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Prevent timeout for ANP rate limit
+builder.WebHost.ConfigureKestrel(o =>
+{
+    o.Limits.KeepAliveTimeout = TimeSpan.FromMinutes(10);
+    o.Limits.RequestHeadersTimeout = TimeSpan.FromMinutes(10);
+});
 
 // Add OpenAPI support
 builder.Services.AddOpenApi();
@@ -21,7 +29,7 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 
 var startTime = DateTime.UtcNow;
-var httpClient = new HttpClient();
+var httpClient = new HttpClient{ Timeout = TimeSpan.FromMinutes(5)}; // Prevent timeout for ANP rate limit
 httpClient.DefaultRequestHeaders.Add("User-Agent", "AnpCnGStation/1.0");
 
 app.MapGet("/health", () =>
@@ -46,26 +54,70 @@ app.MapGet("/health", () =>
 
 app.MapGet("/truck-cgn-stations", async (HttpContext context) =>
 {
-    const string url = "https://revendedoresapi.anp.gov.br/v1/combustivel?numeropagina=1";
+    const string baseUrl = "https://revendedoresapi.anp.gov.br/v1/combustivel?numeropagina=";
 
-    // Get ANP API response
-    var response = await httpClient.GetAsync(url);
-    if (!response.IsSuccessStatusCode)
-    {
-        return Results.Problem($"Failed to Fetch data from ANP API. Status: {response.StatusCode}");
-    };
-
-    var json = await response.Content.ReadAsStringAsync();
+    var allStations = new List<Station>();
     var options = new JsonSerializerOptions
     {
         PropertyNameCaseInsensitive = true,
         NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
     };
+    int currentPage = 1;
+    int totalPages = 1;
+    int retries = 0;
+    const int maxRetries = 5;
 
-    var anpResponse = JsonSerializer.Deserialize<AnpResponse>(json, options);
-    if (anpResponse?.Data == null) return Results.Problem("No data returned from ANP API.");
+    do
+    {
+        // Get ANP API response
+        var response = await httpClient.GetAsync($"{baseUrl}{currentPage}");
 
-    var filtered = FilterStations(anpResponse.Data).ToList();
+        // Try after header how long to wait
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+        {
+            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalMilliseconds ?? (1000 * Math.Pow(2, retries));
+            Console.WriteLine($" Rate-limited, waiting {retryAfter / 1000:F1}s before retry ({retries + 1}/{maxRetries})");
+            await Task.Delay((int)retryAfter);
+            retries++;
+            if (retries >= maxRetries) break;
+            continue;
+        }
+
+        if (!response.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"Failed to Fetch data from ANP API page {currentPage}. Status: {response.StatusCode}");
+            break;
+        };
+
+        // success -> reset retries
+        retries = 0;
+
+        var json = await response.Content.ReadAsStringAsync();
+        var anpResponse = JsonSerializer.Deserialize<AnpResponse>(json, options);
+
+        if (anpResponse?.Data == null) break;
+
+        // Merge
+        allStations.AddRange(anpResponse.Data);
+
+        // Get total pages
+        if (anpResponse.SearchPageFilter?.TotalPagina > 0)
+            totalPages = anpResponse.SearchPageFilter.TotalPagina;
+
+        Console.Write($"Loaded page {currentPage}/{totalPages} ({allStations.Count} stations)");
+        currentPage++;
+
+        // Prevent ANP API request rate limit
+        await Task.Delay(5000);
+
+    } while (currentPage <= totalPages);
+    
+    if (allStations.Count == 0)
+    {
+        return Results.Problem("No data Returned from ANP API");
+    }
+
+    var filtered = FilterStations(allStations).ToList();
     var enriched = EnrichStations(filtered, AddNaturgyFlag, AddAccuracyScore).ToList();
 
     var csvBytes = CsvExporter.ExportStationsToScv(enriched);
@@ -202,6 +254,15 @@ public class AnpResponse
     public string? Title { get; set; }
     public bool Succeeded { get; set; }
     public List<Station>? Data { get; set; }
+    public SearchPageFilter? SearchPageFilter { get; set; }
+}
+
+public class SearchPageFilter
+{
+    public int NumeroPagina { get; set; }
+    public int TamanhoPagina { get; set; }
+    public int TotalRegistro { get; set; }
+    public int TotalPagina { get; set; }
 }
 
 public class Station
@@ -215,7 +276,7 @@ public class Station
     public string? Uf { get; set; }
     public string? Cep { get; set; }
     public string? SituacaoConstatada { get; set; }
-    public string? Distribuidora { get; set; } 
+    public string? Distribuidora { get; set; }
     public List<Product>? Produtos { get; set; }
     public string? Latitude { get; set; }
     public string? Longitude { get; set; }
