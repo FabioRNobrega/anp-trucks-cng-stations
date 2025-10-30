@@ -5,7 +5,6 @@ using System.Text.Json;
 using CsvHelper;
 using CsvHelper.Configuration;
 
-
 var builder = WebApplication.CreateBuilder(args);
 
 // Prevent timeout for ANP rate limit
@@ -29,7 +28,7 @@ if (app.Environment.IsDevelopment())
 app.UseHttpsRedirection();
 
 var startTime = DateTime.UtcNow;
-var httpClient = new HttpClient{ Timeout = TimeSpan.FromMinutes(5)}; // Prevent timeout for ANP rate limit
+var httpClient = new HttpClient{ Timeout = TimeSpan.FromMinutes(10)}; // Prevent timeout for ANP rate limit
 httpClient.DefaultRequestHeaders.Add("User-Agent", "AnpCnGStation/1.0");
 
 app.MapGet("/health", () =>
@@ -52,82 +51,102 @@ app.MapGet("/health", () =>
 
 
 
-app.MapGet("/truck-cgn-stations", async (HttpContext context) =>
+app.MapGet("/truck-cgn-stations", async (HttpContext context, int? page) =>
 {
     const string baseUrl = "https://revendedoresapi.anp.gov.br/v1/combustivel?numeropagina=";
+    const string progressFile = "progress.json";
+    const string csvFile = "anp_station_partial.csv";
 
-    var allStations = new List<Station>();
     var options = new JsonSerializerOptions
     {
         PropertyNameCaseInsensitive = true,
         NumberHandling = System.Text.Json.Serialization.JsonNumberHandling.AllowReadingFromString
     };
-    int currentPage = 1;
-    int totalPages = 1;
-    int retries = 0;
-    const int maxRetries = 5;
+    int startPage = page ?? 1;
+    int totalFetched = 0;
+    int pagesFetched = 0;
+
+    // Check for progress.json
+    if (!page.HasValue && File.Exists(progressFile))
+    {
+        var progress = JsonSerializer.Deserialize<ProgressInfo>(File.ReadAllText(progressFile));
+        if (progress != null)
+        {
+            startPage = progress.LastCompletedPage + 1;
+            totalFetched = progress.StationSaved;
+            Console.WriteLine($"Resuming from page {startPage}, {totalFetched} stations saved so far");
+        }
+    }
+
+    Console.WriteLine("#### START REQUEST WITH PAGINATION");
 
     do
     {
         // Get ANP API response
-        var response = await httpClient.GetAsync($"{baseUrl}{currentPage}");
-
-        // Try after header how long to wait
-        if (response.StatusCode == HttpStatusCode.TooManyRequests)
-        {
-            var retryAfter = response.Headers.RetryAfter?.Delta?.TotalMilliseconds ?? (1000 * Math.Pow(2, retries));
-            Console.WriteLine($" Rate-limited, waiting {retryAfter / 1000:F1}s before retry ({retries + 1}/{maxRetries})");
-            await Task.Delay((int)retryAfter);
-            retries++;
-            if (retries >= maxRetries) break;
-            continue;
-        }
-
+        var response = await httpClient.GetAsync($"{baseUrl}{startPage}");
         if (!response.IsSuccessStatusCode)
         {
-            Console.WriteLine($"Failed to Fetch data from ANP API page {currentPage}. Status: {response.StatusCode}");
+            Console.WriteLine($"Failed to Fetch data from ANP API page {startPage}. Status: {response.StatusCode}");
             break;
         };
-
-        // success -> reset retries
-        retries = 0;
 
         var json = await response.Content.ReadAsStringAsync();
         var anpResponse = JsonSerializer.Deserialize<AnpResponse>(json, options);
 
-        if (anpResponse?.Data == null) break;
+        // stop when no data
+        if (anpResponse?.Data == null || anpResponse?.Data.Count == 0)
+        {
+            Console.WriteLine($"No more data after page {startPage - 1}.");
+            break;
+        }
 
-        // Merge
-        allStations.AddRange(anpResponse.Data);
+        var filtered = FilterStations(anpResponse!.Data!).ToList();
+        var enriched = EnrichStations(filtered, AddNaturgyFlag, AddAccuracyScore).OrderByDescending(s => s.AccuracyScore).ToList();
 
-        // Get total pages
-        if (anpResponse.SearchPageFilter?.TotalPagina > 0)
-            totalPages = anpResponse.SearchPageFilter.TotalPagina;
+        // Save wach page
+        CsvExporter.AppendStationToScv(enriched, csvFile);
 
-        Console.Write($"Loaded page {currentPage}/{totalPages} ({allStations.Count} stations)");
-        currentPage++;
+        totalFetched += enriched.Count;
+        pagesFetched++;
+        Console.WriteLine($"Loaded page {startPage} (+{anpResponse!.Data.Count}, total {totalFetched})");
+
+        // Update progress.json
+        var progressInfo = new ProgressInfo
+        {
+            LastCompletedPage = startPage,
+            StationSaved = totalFetched,
+            Timestamp = DateTime.UtcNow
+        };
+        File.WriteAllText(progressFile, JsonSerializer.Serialize(progressInfo, new JsonSerializerOptions { WriteIndented = true }));
 
         // Prevent ANP API request rate limit
         await Task.Delay(5000);
+        startPage++;
+    } while (!page.HasValue);
 
-    } while (currentPage <= totalPages);
-    
-    if (allStations.Count == 0)
+    Console.WriteLine($"############## FETCH COMPLETED: {pagesFetched} pages processed, {totalFetched} stations saved (last page: {startPage - 1})");
+
+    if (page.HasValue)
     {
-        return Results.Problem("No data Returned from ANP API");
+        var csvBytes = await File.ReadAllBytesAsync(csvFile);
+        context.Response.Headers.Append(
+            "Content-Disposition",
+            "attachment; filename=truck_cng_stations_by_anp.csv"
+        );
+
+        return Results.File(csvBytes, "text/csv");
     }
 
-    var filtered = FilterStations(allStations).ToList();
-    var enriched = EnrichStations(filtered, AddNaturgyFlag, AddAccuracyScore).ToList();
-
-    var csvBytes = CsvExporter.ExportStationsToScv(enriched);
-
-    context.Response.Headers.Append(
-        "Content-Disposition",
-        "attachment; filename=truck_cng_stations_by_anp.csv"
-    );
-
-    return Results.File(csvBytes, "text/csv");
+    // Full fetch mode
+   return Results.Json(new
+    {
+        status = "completed",
+        pages_processed = pagesFetched,
+        stations_saved = totalFetched,
+        last_page = startPage - 1,
+        file = csvFile,
+        progress = progressFile
+    });
 
 })
 .WithName("GetTruckCngStations")
@@ -336,17 +355,33 @@ public static class CsvSchema
         "date_when_added_to_list",
         "source",
         "comments",
-        "accuracy_score"
+        "accuracy_score",
+        "identification_document"
     };
 }
 
 
 public static class CsvExporter
 {
-    public static byte[] ExportStationsToScv(IEnumerable<Station> stations)
+    public static byte[] ExportStationsToCsv(IEnumerable<Station> stations)
     {
         using var memory = new MemoryStream();
         using var writer = new StreamWriter(memory, Encoding.UTF8);
+        WriteStationToCsv(writer, stations, writeHeader: true);
+        writer.Flush();
+        return memory.ToArray();
+    }
+
+    public static void AppendStationToScv(IEnumerable<Station> stations, string filePath)
+    {
+        bool fileExists = File.Exists(filePath);
+        using var stream = new FileStream(filePath, FileMode.Append, FileAccess.Write, FileShare.Read);
+        using var writer = new StreamWriter(stream, Encoding.UTF8);
+        WriteStationToCsv(writer, stations, writeHeader: !fileExists);
+    }
+
+    private static void WriteStationToCsv(TextWriter writer, IEnumerable<Station> stations, bool writeHeader)
+    {
         using var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture)
         {
             Delimiter = ",",
@@ -354,11 +389,14 @@ public static class CsvExporter
             ShouldQuote = args => true,
         });
 
-        foreach (var header in CsvSchema.Headers)
-            csv.WriteField(header);
-        csv.NextRecord();
+        if (writeHeader)
+        {
+            foreach (var header in CsvSchema.Headers)
+                csv.WriteField(header);
+            csv.NextRecord();
+        }
 
-        // Write station rows
+        // ✅ Write consistent rows
         foreach (var s in stations)
         {
             csv.WriteField(s.SituacaoConstatada);
@@ -382,18 +420,17 @@ public static class CsvExporter
             csv.WriteField(""); // showers
             csv.WriteField(""); // truck_wash
             csv.WriteField(GetGoogleMapsUrl(s));
-            csv.WriteField(DateTime.UtcNow.ToString("yyyy-MM-dd")); // date_when_added_to_list
+            csv.WriteField(DateTime.UtcNow.ToString("yyyy-MM-dd"));
             csv.WriteField("ANP API v1");
-            csv.WriteField(""); // comments
+            csv.WriteField("");
             csv.WriteField(s.AccuracyScore.ToString("0.0", CultureInfo.InvariantCulture));
+            csv.WriteField(s.Cnpj);
             csv.NextRecord();
         }
 
         writer.Flush();
-        return memory.ToArray();
-
     }
-    
+
     private static string GetGoogleMapsUrl(Station s)
     {
         if (string.IsNullOrWhiteSpace(s.RazaoSocial) &&
@@ -404,4 +441,11 @@ public static class CsvExporter
         var query = Uri.EscapeDataString($"{s.RazaoSocial} {s.Endereco} {s.Municipio} {s.Uf}");
         return $"https://www.google.com/maps?q={query}";
     }
+}
+
+public class ProgressInfo
+{
+    public int LastCompletedPage { get; set; }
+    public int StationSaved { get; set; }
+    public DateTime Timestamp { get; set; }
 }
