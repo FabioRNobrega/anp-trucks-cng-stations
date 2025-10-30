@@ -5,6 +5,8 @@ using System.Text.Json;
 using CsvHelper;
 using CsvHelper.Configuration;
 
+DotNetEnv.Env.Load();
+
 var builder = WebApplication.CreateBuilder(args);
 
 // Prevent timeout for ANP rate limit
@@ -16,6 +18,12 @@ builder.WebHost.ConfigureKestrel(o =>
 
 // Add OpenAPI support
 builder.Services.AddOpenApi();
+
+
+// Mapbox Config
+var mapboxKey = builder.Configuration["MAPBOX_API_KEY"] ?? Environment.GetEnvironmentVariable("MAPBOX_API_KEY") ?? throw new Exception("MAPBOX_API_KEY not set");
+
+builder.Services.AddSingleton(new MapboxGeocoder(new HttpClient(), mapboxKey));
 
 var app = builder.Build();
 
@@ -49,6 +57,105 @@ app.MapGet("/health", () =>
 .WithName("Health")
 .WithDescription("Returns basic health information for the API");
 
+app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest request, MapboxGeocoder geocoder) =>
+{
+    Console.WriteLine("Received request to upload CSV for geocoding...");
+
+    if (!request.HasFormContentType)
+    {
+        Console.WriteLine($"Invalid content type: {request.ContentType}");
+        return Results.BadRequest("Expected multipart/form-data with CSV file");
+    }
+
+    var form = await request.ReadFormAsync();
+    var file = form.Files.GetFile("file");
+
+    if (file == null || file.Length == 0)
+    {
+        Console.WriteLine("Missing or empty file in request.");
+        return Results.BadRequest("Missing or empty file");
+    }
+
+    Console.WriteLine($"File received: {file.FileName} ({file.Length} bytes)");
+
+    using var reader = new StreamReader(file.OpenReadStream());
+    using var csvReader = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture) { Delimiter = "," });
+    var records = csvReader.GetRecords<dynamic>().ToList();
+
+    Console.WriteLine($"CSV loaded with {records.Count} rows");
+
+    var enriched = new List<IDictionary<string, object>>();
+    int successCount = 0, failCount = 0;
+    int rowIndex = 0;
+
+    foreach (var record in records)
+    {
+        rowIndex++;
+        var dict = (IDictionary<string, object>)record;
+
+        string street = dict.ContainsKey("street") ? dict["street"]?.ToString() ?? "" : "";
+        string zip = dict.ContainsKey("zip_code") ? dict["zip_code"]?.ToString() ?? "" : "";
+        string city = dict.ContainsKey("city") ? dict["city"]?.ToString() ?? "" : "";
+        string country = dict.ContainsKey("country") ? dict["country"]?.ToString() ?? "" : "";
+        string code = dict.ContainsKey("country_code") ? dict["country_code"]?.ToString() ?? "" : "";
+
+        var address = $"{street}, {zip}, {city}, {country ?? code}";
+        Console.WriteLine($"[{rowIndex}] Geocoding: {address}");
+
+        try
+        {
+            var coords = await geocoder.GetCoordinatesAsync(street, zip, city, country, code);
+
+            if (coords.HasValue)
+            {
+                dict["latitude"] = coords.Value.lat.ToString(CultureInfo.InvariantCulture);
+                dict["longitude"] = coords.Value.lon.ToString(CultureInfo.InvariantCulture);
+                successCount++;
+                Console.WriteLine($"[{rowIndex}] Coordinates found: ({coords.Value.lat}, {coords.Value.lon})");
+            }
+            else
+            {
+                dict["latitude"] = "";
+                dict["longitude"] = "";
+                failCount++;
+                Console.WriteLine($"[{rowIndex}] No coordinates found");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[{rowIndex}] Error during geocoding: {ex.Message}");
+            failCount++;
+        }
+
+        enriched.Add(dict);
+    }
+
+    Console.WriteLine($"Processing complete: {successCount} successes, {failCount} failures");
+
+    using var memory = new MemoryStream();
+    using (var writer = new StreamWriter(memory, Encoding.UTF8, leaveOpen: true))
+    using (var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture)))
+    {
+        var headers = enriched.First().Keys;
+        foreach (var h in headers) csv.WriteField(h);
+        csv.NextRecord();
+
+        foreach (var row in enriched)
+        {
+            foreach (var val in row.Values)
+                csv.WriteField(val);
+            csv.NextRecord();
+        }
+
+        writer.Flush();
+    }
+
+    memory.Position = 0;
+    Console.WriteLine($"Returning enriched CSV file with {enriched.Count} rows");
+    return Results.File(memory.ToArray(), "text/csv", "enriched_with_coords.csv");
+})
+.WithName("UploadCsv")
+.WithDescription("Uploads a CSV and returns it enriched with latitude/longitude from Mapbox API");
 
 
 app.MapGet("/truck-cgn-stations", async (HttpContext context, int? page) =>
@@ -448,4 +555,35 @@ public class ProgressInfo
     public int LastCompletedPage { get; set; }
     public int StationSaved { get; set; }
     public DateTime Timestamp { get; set; }
+}
+
+public class MapboxGeocoder
+{
+    private readonly HttpClient _httpClient;
+    private readonly string _apiKey;
+
+    public MapboxGeocoder(HttpClient httpClient, string apiKey)
+    {
+        _httpClient = httpClient;
+        _apiKey = apiKey;
+    }
+
+    public async Task<(double lat, double lon)?> GetCoordinatesAsync(string street, string zip, string city, string country, string countryCode)
+    {
+        if (string.IsNullOrWhiteSpace(street) && string.IsNullOrWhiteSpace(city)) return null;
+
+        var address = $"{street}, {zip}, {country ?? country}";
+        var encodedAddress = Uri.EscapeDataString(address);
+        var url = $"https://api.mapbox.com/geocoding/v5/mapbox.places/{encodedAddress}.json?access_token={_apiKey}&limit=1";
+
+        var resp = await _httpClient.GetAsync(url);
+        if (!resp.IsSuccessStatusCode) return null;
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        var features = doc.RootElement.GetProperty("features");
+        if (features.GetArrayLength() == 0) return null;
+
+        var coords = features[0].GetProperty("center");
+        return (coords[1].GetDouble(), coords[0].GetDouble()); // lat, lon
+    }
 }
