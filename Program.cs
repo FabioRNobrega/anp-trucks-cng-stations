@@ -25,6 +25,12 @@ var mapboxKey = builder.Configuration["MAPBOX_API_KEY"] ?? Environment.GetEnviro
 
 builder.Services.AddSingleton(new MapboxGeocoder(new HttpClient(), mapboxKey));
 
+// AzureMaps Config 
+var azureKey = builder.Configuration["AZURE_MAPS_KEY"] ?? Environment.GetEnvironmentVariable("AZURE_MAPS_KEY") ?? throw new Exception("AZURE_MAPS_KEY not set");
+builder.Services.AddSingleton(new AzureGeocoder(new HttpClient(), azureKey));
+
+
+
 var app = builder.Build();
 
 // Configure the HTTP request pipeline
@@ -57,7 +63,7 @@ app.MapGet("/health", () =>
 .WithName("Health")
 .WithDescription("Returns basic health information for the API");
 
-app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest request, MapboxGeocoder geocoder) =>
+app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest request, MapboxGeocoder geocoder, AzureGeocoder azure) =>
 {
     Console.WriteLine("Received request to upload CSV for geocoding...");
 
@@ -79,7 +85,7 @@ app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest requ
     Console.WriteLine($"File received: {file.FileName} ({file.Length} bytes)");
 
     using var reader = new StreamReader(file.OpenReadStream());
-    using var csvReader = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture) { Delimiter = "," });
+    using var csvReader = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture) { Delimiter = ";" });
     var records = csvReader.GetRecords<dynamic>().ToList();
 
     Console.WriteLine($"CSV loaded with {records.Count} rows");
@@ -94,17 +100,22 @@ app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest requ
         var dict = (IDictionary<string, object>)record;
 
         string street = dict.ContainsKey("street") ? dict["street"]?.ToString() ?? "" : "";
-        string zip = dict.ContainsKey("zip_code") ? dict["zip_code"]?.ToString() ?? "" : "";
         string city = dict.ContainsKey("city") ? dict["city"]?.ToString() ?? "" : "";
-        string country = dict.ContainsKey("country") ? dict["country"]?.ToString() ?? "" : "";
-        string code = dict.ContainsKey("country_code") ? dict["country_code"]?.ToString() ?? "" : "";
+        string uf = dict.ContainsKey("uf") ? dict["uf"]?.ToString() ?? "" : "";
+        string zip = dict.ContainsKey("zip_code") ? dict["zip_code"]?.ToString() ?? "" : "";
+        string site_name = dict.ContainsKey("site_name") ? dict["site_name"]?.ToString() ?? "" : "";
 
-        var address = $"{street}, {zip}, {city}, {country ?? code}";
+
+        var address = $"{street}, {city}";
         Console.WriteLine($"[{rowIndex}] Geocoding: {address}");
 
         try
         {
-            var coords = await geocoder.GetCoordinatesAsync(street, zip, city, country, code);
+            var coords = await geocoder.GetCoordinatesAsync(street, city, zip, site_name, uf);
+            if (coords == null) {
+                // fallback to Azure
+                coords = await azure.GetCoordinatesAsync($"{site_name}, {street}, {city}, {uf}, BR");
+            }
 
             if (coords.HasValue)
             {
@@ -445,6 +456,7 @@ public static class CsvSchema
         "city",
         "country",
         "country_code",
+        "uf",
         "latitude",
         "longitude",
         "operator",
@@ -489,12 +501,7 @@ public static class CsvExporter
 
     private static void WriteStationToCsv(TextWriter writer, IEnumerable<Station> stations, bool writeHeader)
     {
-        using var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture)
-        {
-            Delimiter = ",",
-            Quote = '"',
-            ShouldQuote = args => true,
-        });
+        using var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture){ Delimiter = ";"});
 
         if (writeHeader)
         {
@@ -513,10 +520,11 @@ public static class CsvExporter
             csv.WriteField(s.Municipio);
             csv.WriteField("Brazil");
             csv.WriteField("BR");
+            csv.WriteField(s.Uf);
             csv.WriteField("");
             csv.WriteField("");
             csv.WriteField(s.Distribuidora);
-            csv.WriteField(s.NaturgyVerified ? "true" : "false"); // verified_for_trucks
+            csv.WriteField("true"); // verified_for_trucks
             csv.WriteField(""); // green_certified
             csv.WriteField("false"); // lots_partner
             csv.WriteField(""); // restrooms
@@ -526,27 +534,16 @@ public static class CsvExporter
             csv.WriteField(""); // truck_parking
             csv.WriteField(""); // showers
             csv.WriteField(""); // truck_wash
-            csv.WriteField(GetGoogleMapsUrl(s));
+            csv.WriteField("");
             csv.WriteField(DateTime.UtcNow.ToString("yyyy-MM-dd"));
             csv.WriteField("ANP API v1");
             csv.WriteField("");
-            csv.WriteField(s.AccuracyScore.ToString("0.0", CultureInfo.InvariantCulture));
+            csv.WriteField(s.AccuracyScore.ToString("0", CultureInfo.InvariantCulture));
             csv.WriteField(s.Cnpj);
             csv.NextRecord();
         }
 
         writer.Flush();
-    }
-
-    private static string GetGoogleMapsUrl(Station s)
-    {
-        if (string.IsNullOrWhiteSpace(s.RazaoSocial) &&
-        string.IsNullOrWhiteSpace(s.Endereco) &&
-        string.IsNullOrWhiteSpace(s.Municipio))
-            return "";
-
-        var query = Uri.EscapeDataString($"{s.RazaoSocial} {s.Endereco} {s.Municipio} {s.Uf}");
-        return $"https://www.google.com/maps?q={query}";
     }
 }
 
@@ -568,22 +565,165 @@ public class MapboxGeocoder
         _apiKey = apiKey;
     }
 
-    public async Task<(double lat, double lon)?> GetCoordinatesAsync(string street, string zip, string city, string country, string countryCode)
+    public async Task<(double lat, double lon)?> GetCoordinatesAsync(
+        string street, string city, string zip, string siteName, string uf)
     {
-        if (string.IsNullOrWhiteSpace(street) && string.IsNullOrWhiteSpace(city)) return null;
+        if (string.IsNullOrWhiteSpace(street) && string.IsNullOrWhiteSpace(city))
+            return null;
 
-        var address = $"{street}, {zip}, {country ?? country}";
-        var encodedAddress = Uri.EscapeDataString(address);
-        var url = $"https://api.mapbox.com/geocoding/v5/mapbox.places/{encodedAddress}.json?access_token={_apiKey}&limit=1";
+        // If "S/N", enrich the query with known POI or KM hints
+        if (street.Contains("S/N", StringComparison.OrdinalIgnoreCase) && !string.IsNullOrWhiteSpace(siteName))
+            street = $"{street.Replace("S/N", "")}, próximo a {siteName}";
 
+
+        street = street.Replace("RODOVIA ", "", StringComparison.OrdinalIgnoreCase)
+               .Replace("BR ", "BR-", StringComparison.OrdinalIgnoreCase);
+
+
+        // Prioritized attempts
+        var attempts = new[]
+        {
+            $"{siteName}, {city}, {uf}, BR",
+            $"{street}, próximo a {siteName}, {city}, {uf}, BR",
+            $"{street}, {city}, {uf}, BR",
+            $"{street}, {zip}, {city}, {uf}, BR"
+        };
+
+        foreach (var address in attempts.Where(a => !string.IsNullOrWhiteSpace(a)))
+        {
+            var encoded = Uri.EscapeDataString(address);
+            var url =
+                $"https://api.mapbox.com/geocoding/v5/mapbox.places/{encoded}.json" +
+                $"?access_token={_apiKey}" +
+                $"&limit=3" +
+                $"&types=address,poi,place,locality" +
+                $"&country=BR" +
+                $"&autocomplete=false" +
+                $"&language=pt";
+
+            Console.WriteLine($"🌍 Mapbox query: {address}");
+
+            var resp = await _httpClient.GetAsync(url);
+            if (!resp.IsSuccessStatusCode)
+            {
+                Console.WriteLine($"⚠️ Mapbox failed ({(int)resp.StatusCode}) for {address}");
+                continue;
+            }
+
+            var body = await resp.Content.ReadAsStringAsync();
+            if (string.IsNullOrWhiteSpace(body))
+                continue;
+
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                if (!doc.RootElement.TryGetProperty("features", out var features) ||
+                    features.GetArrayLength() == 0)
+                    continue;
+
+                string ufNorm = uf.ToUpperInvariant();
+                string cityNorm = Normalize(city);
+
+                foreach (var f in features.EnumerateArray())
+                {
+                    double relevance = f.TryGetProperty("relevance", out var relProp)
+                        ? relProp.GetDouble() : 0;
+                    string placeName = f.TryGetProperty("place_name", out var pn)
+                        ? pn.GetString() ?? "" : "";
+
+                    // Extract state (UF) from Mapbox context
+                    string? stateCode = ExtractStateCode(f);
+
+                    bool sameUf = string.Equals(stateCode, ufNorm, StringComparison.OrdinalIgnoreCase);
+                    bool cityMatch = Normalize(placeName).Contains(cityNorm);
+
+                    if (relevance >= 0.8 && sameUf && cityMatch)
+                    {
+                        var coords = f.GetProperty("center");
+                        Console.WriteLine($"✅ Match ({relevance:0.00}) [{stateCode}] → {placeName}");
+                        return (coords[1].GetDouble(), coords[0].GetDouble());
+                    }
+                }
+
+                Console.WriteLine($"⚠️ No valid match for {address}");
+            }
+            catch (JsonException ex)
+            {
+                Console.WriteLine($"💥 JSON parse error for {address}: {ex.Message}");
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ExtractStateCode(JsonElement feature)
+    {
+        if (feature.TryGetProperty("context", out var ctx))
+        {
+            foreach (var c in ctx.EnumerateArray())
+            {
+                if (c.TryGetProperty("id", out var id) &&
+                    id.GetString()?.StartsWith("region.") == true &&
+                    c.TryGetProperty("short_code", out var code))
+                {
+                    var parts = code.GetString()?.Split('-');
+                    return parts?.Length > 1 ? parts[1].ToUpperInvariant() : null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static string Normalize(string? s)
+    {
+        if (string.IsNullOrWhiteSpace(s)) return string.Empty;
+        var formD = s.Normalize(NormalizationForm.FormD);
+        var sb = new StringBuilder(capacity: formD.Length);
+        foreach (var ch in formD)
+        {
+            var uc = CharUnicodeInfo.GetUnicodeCategory(ch);
+            if (uc != UnicodeCategory.NonSpacingMark) sb.Append(char.ToUpperInvariant(ch));
+        }
+        return sb.ToString().Normalize(NormalizationForm.FormC);
+    }
+}
+
+
+public class AzureGeocoder
+{
+    private readonly HttpClient _httpClient;
+    private readonly string _apiKey;
+
+    public AzureGeocoder(HttpClient httpClient, string apiKey)
+    {
+        _httpClient = httpClient;
+        _apiKey = apiKey;
+    }
+
+    public async Task<(double lat, double lon)?> GetCoordinatesAsync(string query)
+    {
+        var encoded = Uri.EscapeDataString(query);
+        var url = $"https://atlas.microsoft.com/search/address/json?api-version=1.0&subscription-key={_apiKey}&query={encoded}&countrySet=BR&limit=1&language=pt-BR";
+
+        Console.WriteLine($"🗺️ AzureMaps query: {query}");
         var resp = await _httpClient.GetAsync(url);
-        if (!resp.IsSuccessStatusCode) return null;
 
-        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
-        var features = doc.RootElement.GetProperty("features");
-        if (features.GetArrayLength() == 0) return null;
+        if (!resp.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"⚠️ AzureMaps failed ({(int)resp.StatusCode}) for {query}");
+            return null;
+        }
 
-        var coords = features[0].GetProperty("center");
-        return (coords[1].GetDouble(), coords[0].GetDouble()); // lat, lon
+        var body = await resp.Content.ReadAsStringAsync();
+        using var doc = JsonDocument.Parse(body);
+        if (!doc.RootElement.TryGetProperty("results", out var results) || results.GetArrayLength() == 0)
+            return null;
+
+        var first = results[0];
+        var lat = first.GetProperty("position").GetProperty("lat").GetDouble();
+        var lon = first.GetProperty("position").GetProperty("lon").GetDouble();
+
+        Console.WriteLine($"✅ AzureMaps found: ({lat}, {lon})");
+        return (lat, lon);
     }
 }

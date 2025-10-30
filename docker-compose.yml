@@ -10,6 +10,7 @@ services:
       - "8080:8080"
     environment:
       - MAPBOX_API_KEY=${MAPBOX_API_KEY}
+      - AZURE_MAPS_KEY=${AZURE_MAPS_KEY}
       - ASPNETCORE_ENVIRONMENT=Development
       - ASPNETCORE_URLS=http://+:8080
     volumes:
