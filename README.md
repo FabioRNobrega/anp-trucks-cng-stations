@@ -104,8 +104,6 @@ flowchart LR
     api([⚙️ ANP CNG Stations API<br/>.NET 9 Minimal API])
     anp([🌍 ANP Revendedores API])
     google([🗺️ Google Places API])
-    azure([☁️ Azure Maps API])
-    mapbox([📍 Mapbox Geocoding])
     csv[(📊 CSV Export)]
 
     user --> api
