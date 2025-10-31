@@ -19,17 +19,9 @@ builder.WebHost.ConfigureKestrel(o =>
 // Add OpenAPI support
 builder.Services.AddOpenApi();
 
-
-// Mapbox Config
-var mapboxKey = builder.Configuration["MAPBOX_API_KEY"] ?? Environment.GetEnvironmentVariable("MAPBOX_API_KEY") ?? throw new Exception("MAPBOX_API_KEY not set");
-
-builder.Services.AddSingleton(new MapboxGeocoder(new HttpClient(), mapboxKey));
-
-// AzureMaps Config 
-var azureKey = builder.Configuration["AZURE_MAPS_KEY"] ?? Environment.GetEnvironmentVariable("AZURE_MAPS_KEY") ?? throw new Exception("AZURE_MAPS_KEY not set");
-builder.Services.AddSingleton(new AzureGeocoder(new HttpClient(), azureKey));
-
-
+// GoogleMaps Place config 
+var googleKey = builder.Configuration["GOOGLE_MAPS_KEY"] ?? Environment.GetEnvironmentVariable("GOOGLE_MAPS_KEY") ?? throw new Exception("GOOGLE_MAPS_KEY not set");
+builder.Services.AddSingleton(new GooglePlaceGeocoder(new HttpClient(), googleKey));
 
 var app = builder.Build();
 
@@ -63,7 +55,7 @@ app.MapGet("/health", () =>
 .WithName("Health")
 .WithDescription("Returns basic health information for the API");
 
-app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest request, MapboxGeocoder geocoder, AzureGeocoder azure) =>
+app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest request, GooglePlaceGeocoder googlePlace) =>
 {
     Console.WriteLine("Received request to upload CSV for geocoding...");
 
@@ -85,7 +77,7 @@ app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest requ
     Console.WriteLine($"File received: {file.FileName} ({file.Length} bytes)");
 
     using var reader = new StreamReader(file.OpenReadStream());
-    using var csvReader = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture) { Delimiter = ";" });
+    using var csvReader = new CsvReader(reader, new CsvConfiguration(CultureInfo.InvariantCulture){ Delimiter = ";" });
     var records = csvReader.GetRecords<dynamic>().ToList();
 
     Console.WriteLine($"CSV loaded with {records.Count} rows");
@@ -111,21 +103,14 @@ app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest requ
 
         try
         {
-            var coords = await geocoder.GetCoordinatesAsync(street, city, zip, site_name, uf);
-            if (coords == null) {
-                // fallback to Azure
-                coords = await azure.GetCoordinatesAsync($"{site_name}, {street}, {city}, {uf}, BR");
-            }
-
-            if (coords.HasValue)
+            var coords = await googlePlace.GetCoordinatesAsync(site_name, street, zip, city, uf); 
+            if (coords != null)
             {
                 dict["latitude"] = coords.Value.lat.ToString(CultureInfo.InvariantCulture);
                 dict["longitude"] = coords.Value.lon.ToString(CultureInfo.InvariantCulture);
                 successCount++;
                 Console.WriteLine($"[{rowIndex}] Coordinates found: ({coords.Value.lat}, {coords.Value.lon})");
-            }
-            else
-            {
+            } else {
                 dict["latitude"] = "";
                 dict["longitude"] = "";
                 failCount++;
@@ -145,7 +130,7 @@ app.MapPost("/truck-cng-stations/add-coords/upload-csv", async (HttpRequest requ
 
     using var memory = new MemoryStream();
     using (var writer = new StreamWriter(memory, Encoding.UTF8, leaveOpen: true))
-    using (var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture)))
+    using (var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture){ Delimiter = ";"}))
     {
         var headers = enriched.First().Keys;
         foreach (var h in headers) csv.WriteField(h);
@@ -725,5 +710,78 @@ public class AzureGeocoder
 
         Console.WriteLine($"✅ AzureMaps found: ({lat}, {lon})");
         return (lat, lon);
+    }
+}
+
+public class GooglePlaceGeocoder
+{
+    private readonly HttpClient _httpClient;
+    private readonly string _apiKey;
+
+    public GooglePlaceGeocoder(HttpClient httpClient, string apiKey)
+    {
+        _httpClient = httpClient;
+        _apiKey = apiKey;
+    }
+
+    public async Task<(double lat, double lon)?> GetCoordinatesAsync(string siteName, string street, string zip, string city, string uf)
+    {
+        // Build the query for better matching (station + address)
+        var query = $"{siteName}, {street}, {zip}, {city}, {uf}, BR";
+        var encoded = Uri.EscapeDataString(query);
+
+        // Google Places API endpoint
+        var url =
+            $"https://maps.googleapis.com/maps/api/place/findplacefromtext/json?" +
+            $"input={encoded}" +
+            $"&inputtype=textquery" +
+            $"&fields=geometry,name,formatted_address" +
+            $"&language=pt-BR" +
+            $"&key={_apiKey}";
+
+        Console.WriteLine($"🧭 GooglePlaces query: {query}");
+
+        var resp = await _httpClient.GetAsync(url);
+        if (!resp.IsSuccessStatusCode)
+        {
+            Console.WriteLine($"⚠️ GooglePlaces failed ({(int)resp.StatusCode}) for {query}");
+            return null;
+        }
+
+        var body = await resp.Content.ReadAsStringAsync();
+        if (string.IsNullOrWhiteSpace(body))
+        {
+            Console.WriteLine("⚠️ GooglePlaces returned empty response");
+            return null;
+        }
+
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (!doc.RootElement.TryGetProperty("candidates", out var candidates) ||
+                candidates.GetArrayLength() == 0)
+            {
+                Console.WriteLine($"⚠️ No results from GooglePlaces for {query}");
+                return null;
+            }
+
+            var candidate = candidates[0];
+            var geometry = candidate.GetProperty("geometry").GetProperty("location");
+
+            double lat = geometry.GetProperty("lat").GetDouble();
+            double lon = geometry.GetProperty("lng").GetDouble();
+
+            string name = candidate.TryGetProperty("name", out var n) ? n.GetString() ?? "" : "";
+            string addr = candidate.TryGetProperty("formatted_address", out var a) ? a.GetString() ?? "" : "";
+
+            Console.WriteLine($"✅ GooglePlaces found: {name} → {addr} ({lat}, {lon})");
+
+            return (lat, lon);
+        }
+        catch (JsonException ex)
+        {
+            Console.WriteLine($"💥 JSON parse error in GooglePlaces: {ex.Message}");
+            return null;
+        }
     }
 }
